@@ -2,10 +2,12 @@ import { whatsabi } from "@shazow/whatsabi";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
 	AlertTriangle,
+	Braces,
 	Check,
 	Copy,
 	Loader2,
 	LogOut,
+	SquareFunction,
 	Wallet,
 } from "lucide-react";
 import { createParser, parseAsInteger, useQueryState } from "nuqs";
@@ -31,10 +33,18 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { config } from "./wagmi";
 
 type JsonObject = Record<string, unknown>;
+
+type AbiInput = {
+	name?: string;
+	type?: string;
+	internalType?: string;
+	components?: AbiInput[];
+};
 
 function safeJsonStringify(value: unknown, space?: number) {
 	return JSON.stringify(
@@ -133,27 +143,15 @@ function buildRpcParams(
 	if (method === "eth_sendTransaction") {
 		const tx = { ...rawParams };
 		const from = (tx.from as string | undefined) ?? fallbackAddress;
-		if (!from) {
-			return {
-				ok: false,
-				error:
-					"eth_sendTransaction needs a `from` address (either in params.from or via connected wallet).",
-			};
-		}
-		return { ok: true, params: [{ ...tx, from }] };
+		// Some wallets/providers require `from`, but we can still show/validate the
+		// request before a wallet is connected. Once connected, we will fill it.
+		return { ok: true, params: [from ? { ...tx, from } : tx] };
 	}
 
 	if (method === "wallet_sendCalls") {
 		const calls = { ...rawParams };
 		const from = (calls.from as string | undefined) ?? fallbackAddress;
-		if (!from) {
-			return {
-				ok: false,
-				error:
-					"wallet_sendCalls needs a `from` address (either in params.from or via connected wallet).",
-			};
-		}
-		return { ok: true, params: [{ ...calls, from }] };
+		return { ok: true, params: [from ? { ...calls, from } : calls] };
 	}
 
 	if (method === "personal_sign") {
@@ -219,6 +217,7 @@ type DecodedCall =
 			decoded: {
 				functionName: string;
 				args?: unknown;
+				inputs?: AbiInput[];
 			};
 			resolvedAddress?: string;
 			contractName?: string;
@@ -280,6 +279,31 @@ function extractCalldataTargets(
 	}
 
 	return [];
+}
+
+function shortenHex(value: string, start = 6, end = 4) {
+	if (!value.startsWith("0x")) return value;
+	if (value.length <= start + end + 2) return value;
+	return `${value.slice(0, start + 2)}…${value.slice(-end)}`;
+}
+
+function isAddressLike(value: string) {
+	return value.startsWith("0x") && value.length === 42;
+}
+
+function formatAbiType(input: AbiInput | undefined) {
+	const t = input?.type;
+	const it = input?.internalType;
+	if (t === "tuple" || (typeof t === "string" && t.startsWith("tuple"))) {
+		if (typeof it === "string" && it.startsWith("struct ")) {
+			const structPath = it.replace(/^struct\s+/, "").trim();
+			const name = structPath.split(".").pop();
+			return name ? `tuple ${name}` : "tuple";
+		}
+		return "tuple";
+	}
+	if (typeof it === "string" && it.length > 0) return it;
+	return typeof t === "string" ? t : "unknown";
 }
 
 function App() {
@@ -482,6 +506,11 @@ function App() {
 		queryFn: async () => {
 			if (!publicClient) throw new Error("No public client");
 
+			// Prefer Sourcify for ABI loading (no Etherscan dependency).
+			const abiLoader = new whatsabi.loaders.SourcifyABILoader({
+				chainId: requestedChainId ?? 1,
+			});
+
 			const signatureLookup = new whatsabi.loaders.OpenChainSignatureLookup();
 
 			return Promise.all(
@@ -491,6 +520,7 @@ function App() {
 						const r = await whatsabi.autoload(to, {
 							provider: publicClient,
 							followProxies: true,
+							abiLoader,
 						});
 
 						if (!r.abi) {
@@ -511,6 +541,43 @@ function App() {
 							data,
 						});
 
+						const toAbiInput = (inp: any): AbiInput => {
+							const out: AbiInput = {
+								name: typeof inp?.name === "string" ? inp.name : undefined,
+								type: typeof inp?.type === "string" ? inp.type : undefined,
+								internalType:
+									typeof inp?.internalType === "string"
+										? inp.internalType
+										: undefined,
+							};
+							if (Array.isArray(inp?.components)) {
+								out.components = inp.components.map(toAbiInput);
+							}
+							return out;
+						};
+
+						let inputs: AbiInput[] | undefined;
+						try {
+							const abiArray = r.abi as unknown as Array<any>;
+							const candidates = abiArray.filter(
+								(item) =>
+									item?.type === "function" &&
+									item?.name === decodedFn.functionName,
+							);
+							const argCount = Array.isArray(decodedFn.args)
+								? decodedFn.args.length
+								: 0;
+							const exact = candidates.find(
+								(item) => (item?.inputs?.length || 0) === argCount,
+							);
+							const fnItem = exact || candidates[0];
+							if (fnItem?.inputs && Array.isArray(fnItem.inputs)) {
+								inputs = fnItem.inputs.map(toAbiInput);
+							}
+						} catch {
+							// ignore
+						}
+
 						return {
 							ok: true,
 							to,
@@ -518,6 +585,7 @@ function App() {
 							decoded: {
 								functionName: decodedFn.functionName,
 								args: decodedFn.args as unknown,
+								inputs,
 							},
 							resolvedAddress:
 								typeof (r as unknown as { address?: unknown }).address ===
@@ -627,28 +695,132 @@ function App() {
 			: safeJsonStringify(result, 2);
 	}, [executionError, result]);
 
-	const decodedPreview = React.useMemo(() => {
-		if (!decodedCalls) return null;
-		return safeJsonStringify(
-			decodedCalls.map((c) =>
-				c.ok
-					? {
-							to: c.to,
-							contractName: c.contractName,
-							resolvedAddress: c.resolvedAddress,
-							function: c.decoded.functionName,
-							args: c.decoded.args,
+	const decodedOkCalls = React.useMemo(
+		() => (decodedCalls?.filter((c) => c.ok) ?? []) as Array<Extract<DecodedCall, { ok: true }>>,
+		[decodedCalls],
+	);
+	const hasSuccessfulDecoding = decodedOkCalls.length > 0;
+	const [requestPreviewMode, setRequestPreviewMode] = React.useState<
+		"decoded" | "raw"
+	>("raw");
+	const hadDecodedRef = React.useRef(false);
+
+	// Default to Decoded when it becomes available for a request.
+	React.useEffect(() => {
+		const hasDecodedNow = decodedOkCalls.length > 0;
+		if (!hadDecodedRef.current && hasDecodedNow) {
+			setRequestPreviewMode("decoded");
+		}
+		hadDecodedRef.current = hasDecodedNow;
+	}, [decodedOkCalls.length]);
+
+	// If the decoded view disappears, fall back to Raw.
+	React.useEffect(() => {
+		if (requestPreviewMode === "decoded" && decodedOkCalls.length === 0) {
+			setRequestPreviewMode("raw");
+		}
+	}, [decodedOkCalls.length, requestPreviewMode]);
+
+	function renderArgValue(value: unknown, input?: AbiInput) {
+		const type = input?.type;
+		if (type === "address" && typeof value === "string" && isAddressLike(value)) {
+			return (
+				<span className="inline-flex items-center gap-1">
+					<span className="font-mono break-all">{value}</span>
+					<Button
+						variant="ghost"
+						size="icon-xs"
+						onClick={async () => {
+							await copyToClipboard(value);
+							setCopyStatus("Copied address");
+						}}
+						title="Copy address"
+					>
+						<Copy />
+					</Button>
+				</span>
+			);
+		}
+
+		if (type === "address[]" && Array.isArray(value)) {
+			return (
+				<div className="space-y-1">
+					{value.map((addr) => {
+						if (typeof addr !== "string" || !isAddressLike(addr)) {
+							return <div key={safeJsonStringify(addr)}>{String(addr)}</div>;
 						}
-					: {
-							to: c.to,
-							selector: c.selector,
-							error: c.error,
-							possibleSignatures: c.possibleSignatures,
-						},
-			),
-			2,
-		);
-	}, [decodedCalls]);
+						return (
+							<div key={addr}>
+								{renderArgValue(addr, { name: "", type: "address" })}
+							</div>
+						);
+					})}
+				</div>
+			);
+		}
+
+		if (type === "tuple" && Array.isArray(value) && input?.components) {
+			return (
+				<div className="divide-y rounded-md border">
+					{input.components.map((c, idx) => (
+						<div key={`${idx}:${c.name ?? ""}:${c.type ?? ""}`} className="p-2">
+							<div className="flex items-center justify-between gap-2">
+								<div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+									{c.name || `arg${idx}`}
+								</div>
+								<Badge variant="outline">{formatAbiType(c)}</Badge>
+							</div>
+							<div className="mt-1 text-sm">
+								{renderArgValue(value[idx], c)}
+							</div>
+						</div>
+					))}
+				</div>
+			);
+		}
+
+		const isTupleArrayType =
+			type === "tuple[]" || (typeof type === "string" && /^tuple\[\d+\]$/.test(type));
+		if (
+			isTupleArrayType &&
+			Array.isArray(value) &&
+			input?.components
+		) {
+			return (
+				<div className="space-y-2">
+					{value.map((item, i) => (
+						<div
+							key={`${i}:${typeof item === "string" ? item : typeof item === "bigint" ? item.toString() : ""}`}
+							className="rounded-md border p-2"
+						>
+							<div className="mb-1 text-xs text-muted-foreground">#{i}</div>
+							{renderArgValue(item, { ...input, type: "tuple" })}
+						</div>
+					))}
+				</div>
+			);
+		}
+
+		if (typeof value === "bigint") return value.toString();
+		if (typeof value === "string") {
+			if (isAddressLike(value)) {
+				return renderArgValue(value, { name: "", type: "address" });
+			}
+			return value.startsWith("0x") ? (
+				<span className="font-mono break-all">{value}</span>
+			) : (
+				<span>{value}</span>
+			);
+		}
+		if (Array.isArray(value) || (value && typeof value === "object")) {
+			return (
+				<pre className="whitespace-pre-wrap break-words rounded-md bg-muted p-2 text-xs">
+					{safeJsonStringify(value, 2)}
+				</pre>
+			);
+		}
+		return <span>{String(value)}</span>;
+	}
 
 	return (
 		<div className="min-h-svh bg-background text-foreground">
@@ -674,6 +846,95 @@ function App() {
 						)}
 					</Badge>
 				</header>
+
+				<Card>
+					<CardHeader className="space-y-1">
+						<CardTitle className="text-base">Wallet</CardTitle>
+						<div className="text-sm text-muted-foreground">
+							{isConnected ? "Connected" : "Connect to continue"}
+						</div>
+					</CardHeader>
+					<CardContent className="space-y-3">
+						{isConnected ? (
+							<>
+								<div className="flex flex-wrap items-center gap-2 text-sm">
+									<Badge variant="secondary">
+										<Wallet />
+										{connectedAddress ?? "(unknown)"}
+									</Badge>
+									{connectedAddress && (
+										<Button
+											variant="ghost"
+											size="icon-xs"
+											onClick={async () => {
+												await copyToClipboard(connectedAddress);
+												setCopyStatus("Copied address");
+											}}
+											title="Copy connected address"
+										>
+											<Copy />
+										</Button>
+									)}
+									<Badge variant="outline">
+										chainId: {connection.chainId ?? "(unknown)"}
+									</Badge>
+								</div>
+
+								<div className="flex flex-wrap gap-2">
+									{needsChainSwitch && requestedChainId != null && (
+										<Button
+											variant="outline"
+											onClick={() =>
+												chainSwitchMutation.mutate(
+													requestedChainId as SupportedChainId,
+												)
+											}
+											disabled={isSwitchingChain}
+										>
+											{isSwitchingChain ? (
+												<>
+													<Loader2 className="animate-spin" />
+													Switching
+												</>
+											) : (
+												<>Switch to {requestedChainId}</>
+											)}
+										</Button>
+									)}
+									<Button variant="outline" onClick={() => disconnect()}>
+										<LogOut />
+										Disconnect
+									</Button>
+								</div>
+							</>
+						) : (
+							<>
+								<div className="flex flex-col gap-2">
+									{connectors.map((connector) => (
+										<Button
+											key={connector.uid}
+											variant="outline"
+											onClick={() => connect({ connector })}
+										>
+											<Wallet />
+											{connector.name}
+										</Button>
+									))}
+								</div>
+								{status && (
+									<p className="text-sm text-muted-foreground">{status}</p>
+								)}
+								{error?.message && (
+									<Alert variant="destructive">
+										<AlertTriangle className="h-4 w-4" />
+										<AlertTitle>Connection error</AlertTitle>
+										<AlertDescription>{error.message}</AlertDescription>
+									</Alert>
+								)}
+							</>
+						)}
+					</CardContent>
+				</Card>
 
 				<Card>
 					<CardHeader className="space-y-1">
@@ -725,138 +986,186 @@ function App() {
 									</Alert>
 								)}
 
-								<div>
-									<div className="mb-2 text-sm font-medium">Preview</div>
-									<pre className="max-h-64 overflow-auto rounded-md bg-muted p-3 text-xs">
-										{requestPreview}
-									</pre>
-								</div>
-
-								{calldataTargets.length > 0 && (
-									<>
-										<Separator />
-										<div className="flex items-center justify-between gap-2">
-											<div className="text-sm font-medium">
-												Calldata decoding
-											</div>
-											<Badge variant="outline">
-												{isDecoding
-													? "loading"
-													: decodedCalls
-														? "ready"
-														: "pending"}
-											</Badge>
+								{hasSuccessfulDecoding ? (
+									<Tabs
+										value={requestPreviewMode}
+										onValueChange={(v) =>
+											setRequestPreviewMode(v as "decoded" | "raw")
+										}
+									>
+										<div className="flex flex-wrap items-center justify-between gap-2">
+											<div className="text-sm font-medium">Preview</div>
+											<TabsList>
+												<TabsTrigger value="decoded">
+													<SquareFunction className="mr-2 h-4 w-4" />
+													Decoded
+												</TabsTrigger>
+												<TabsTrigger value="raw">
+													<Braces className="mr-2 h-4 w-4" />
+													Raw
+												</TabsTrigger>
+											</TabsList>
 										</div>
-										{decodedPreview && (
+
+										<TabsContent value="decoded" className="mt-3">
+											<div className="space-y-2">
+												{decodedOkCalls.map((call, i) => {
+													const args = Array.isArray(call.decoded.args)
+														? (call.decoded.args as unknown[])
+														: [];
+												const inputs = call.decoded.inputs ?? [];
+												const signature = `${call.decoded.functionName}(${inputs
+													.map((inp, idx) =>
+														`${formatAbiType(inp)} ${inp.name ?? `arg${idx}`}`.trim(),
+													)
+													.join(", ")})`;
+
+														return (
+															<div
+																key={`${call.to}:${call.data}:${i}`}
+																className="rounded-md border p-3"
+															>
+														<div className="flex items-start justify-between gap-2">
+															<div className="min-w-0">
+																<div className="flex items-center gap-2">
+																	<SquareFunction className="h-4 w-4 shrink-0 text-muted-foreground" />
+																	<div className="min-w-0">
+																		<div className="truncate text-sm font-medium">
+																			{call.decoded.functionName}
+																		</div>
+																		<div className="truncate text-xs text-muted-foreground">
+																			{call.contractName ? `${call.contractName} • ` : ""}
+																			{shortenHex(call.to)}
+																		</div>
+																		{call.resolvedAddress && call.resolvedAddress !== call.to && (
+																			<div className="truncate text-xs text-muted-foreground">
+																				impl: {shortenHex(call.resolvedAddress)}
+																			</div>
+																		)}
+																	</div>
+																</div>
+															</div>
+
+																<Button
+																	variant="outline"
+																	size="icon-sm"
+																	onClick={async () => {
+																	await copyToClipboard(call.to);
+																	setCopyStatus("Copied address");
+																}}
+																title="Copy to address"
+															>
+																<Copy />
+															</Button>
+														</div>
+
+														<div className="mt-2 text-xs text-muted-foreground">
+															<span className="font-mono">{signature}</span>
+														</div>
+
+														{args.length > 0 ? (
+															<div className="mt-3 divide-y rounded-md border">
+														{args.map((arg, idx) => {
+															const inp = inputs[idx] ?? {};
+															const label = inp.name || `arg${idx}`;
+															const type = inp.type;
+															return (
+																<div
+																	key={`${label}:${type ?? ""}:${safeJsonStringify(arg)}`}
+																	className="p-2"
+																>
+																<div className="flex items-center justify-between gap-2">
+																	<div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+																		{label}
+																	</div>
+																	{type && (
+																		<Badge variant="outline">{formatAbiType(inp)}</Badge>
+																	)}
+																</div>
+																	<div className="mt-1 text-sm">
+																		{renderArgValue(arg, inp)}
+																	</div>
+																</div>
+															);
+														})}
+														</div>
+													) : (
+														<p className="mt-3 text-sm text-muted-foreground">No arguments.</p>
+													)}
+												</div>
+											);
+										})}
+										</div>
+									</TabsContent>
+
+									<TabsContent value="raw" className="mt-3">
+										<pre className="max-h-64 overflow-auto rounded-md bg-muted p-3 text-xs">
+											{requestPreview}
+										</pre>
+									</TabsContent>
+								</Tabs>
+							) : (
+									<>
+										<div>
+											<div className="mb-2 flex items-center justify-between gap-2">
+												<div className="text-sm font-medium">Preview</div>
+												{calldataTargets.length > 0 && (
+													<Badge variant="outline">
+														{isDecoding
+															? "decoding"
+															: decodedCalls
+																? "decoded"
+																: "pending"}
+													</Badge>
+												)}
+											</div>
 											<pre className="max-h-64 overflow-auto rounded-md bg-muted p-3 text-xs">
-												{decodedPreview}
+												{requestPreview}
 											</pre>
+										</div>
+
+										{calldataTargets.length > 0 && decodedCalls && !isDecoding && (
+											<>
+												<Separator />
+												<p className="text-sm text-muted-foreground">
+													Decoding did not resolve a function for this calldata.
+												</p>
+											</>
 										)}
 									</>
 								)}
 							</>
 						)}
-					</CardContent>
-				</Card>
 
-				<Card>
-					<CardHeader className="space-y-1">
-						<CardTitle className="text-base">Wallet</CardTitle>
-						<div className="text-sm text-muted-foreground">
-							{isConnected ? "Connected" : "Connect to continue"}
+						<Separator />
+						<div className="flex flex-wrap items-center gap-2">
+							<Button
+								onClick={() => executionMutation.mutate()}
+								disabled={!canOpenRequest || isExecuting}
+							>
+								{isExecuting ? (
+									<>
+										<Loader2 className="animate-spin" />
+										Opening
+									</>
+								) : (
+									<>Open Request</>
+								)}
+							</Button>
+							{normalizedRedirectUrl && (
+								<Badge variant="secondary">redirect after approval</Badge>
+							)}
 						</div>
-					</CardHeader>
-					<CardContent className="space-y-3">
-						{isConnected ? (
-							<>
-								<div className="flex flex-wrap items-center gap-2 text-sm">
-									<Badge variant="secondary">
-										<Wallet />
-										{connectedAddress ?? "(unknown)"}
-									</Badge>
-									<Badge variant="outline">
-										chainId: {connection.chainId ?? "(unknown)"}
-									</Badge>
-								</div>
-
-								<div className="flex flex-wrap gap-2">
-									{needsChainSwitch && requestedChainId != null && (
-										<Button
-											variant="outline"
-											onClick={() =>
-												chainSwitchMutation.mutate(
-													requestedChainId as SupportedChainId,
-												)
-											}
-											disabled={isSwitchingChain}
-										>
-											{isSwitchingChain ? (
-												<>
-													<Loader2 className="animate-spin" />
-													Switching
-												</>
-											) : (
-												<>Switch to {requestedChainId}</>
-											)}
-										</Button>
-									)}
-									<Button
-										onClick={() => executionMutation.mutate()}
-										disabled={!canOpenRequest || isExecuting}
-									>
-										{isExecuting ? (
-											<>
-												<Loader2 className="animate-spin" />
-												Opening
-											</>
-										) : (
-											<>Open Request</>
-										)}
-									</Button>
-									<Button variant="outline" onClick={() => disconnect()}>
-										<LogOut />
-										Disconnect
-									</Button>
-								</div>
-
-								{!canOpenRequest && !isExecuting && (
-									<p className="text-sm text-muted-foreground">
-										{requestError
+						{!canOpenRequest && !isExecuting && (
+							<p className="text-sm text-muted-foreground">
+								{!isConnected
+									? "Connect your wallet above to open this request."
+									: needsChainSwitch
+										? `Switch to chainId ${requestedChainId} to continue.`
+										: requestError
 											? `Fix request: ${requestError}`
 											: "Waiting for wallet client…"}
-									</p>
-								)}
-								{normalizedRedirectUrl && (
-									<p className="text-sm text-muted-foreground">
-										After approval, you will be redirected.
-									</p>
-								)}
-							</>
-						) : (
-							<>
-								<div className="flex flex-col gap-2">
-									{connectors.map((connector) => (
-										<Button
-											key={connector.uid}
-											variant="outline"
-											onClick={() => connect({ connector })}
-										>
-											<Wallet />
-											{connector.name}
-										</Button>
-									))}
-								</div>
-								{status && (
-									<p className="text-sm text-muted-foreground">{status}</p>
-								)}
-								{error?.message && (
-									<Alert variant="destructive">
-										<AlertTriangle className="h-4 w-4" />
-										<AlertTitle>Connection error</AlertTitle>
-										<AlertDescription>{error.message}</AlertDescription>
-									</Alert>
-								)}
-							</>
+							</p>
 						)}
 					</CardContent>
 				</Card>
