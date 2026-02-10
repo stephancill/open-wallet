@@ -8,6 +8,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@base-org/account": "^2.5.2",
     "@shazow/whatsabi": "0.23.0",
     "@tanstack/react-query": "5.90.10",
     "nuqs": "2.8.1",

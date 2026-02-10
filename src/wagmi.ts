@@ -1,6 +1,7 @@
 import type { Chain } from "viem";
 import { createConfig, http, type Transport } from "wagmi";
 import * as chains from "wagmi/chains";
+import { baseAccount } from "wagmi/connectors";
 
 const chainList = Object.values(chains) as unknown as readonly [
 	Chain,
@@ -16,6 +17,14 @@ const transports = chainList.reduce(
 );
 
 export const config = createConfig({
+  connectors: [
+    baseAccount({
+      appName: "open-wallet",
+      preference: {
+        telemetry: false
+      }
+    })
+  ],
 	chains: chainList,
 	transports,
 });
