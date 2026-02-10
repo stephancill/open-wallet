@@ -36,6 +36,17 @@ import { config } from "./wagmi";
 
 type JsonObject = Record<string, unknown>;
 
+function safeJsonStringify(value: unknown, space?: number) {
+	return JSON.stringify(
+		value,
+		(_, v) => {
+			if (typeof v === "bigint") return v.toString();
+			return v;
+		},
+		space,
+	);
+}
+
 const parseAsUnsafeJson = createParser({
 	parse: (query: string) => {
 		const maybeDecodeOnce = (value: string) => {
@@ -327,7 +338,7 @@ function App() {
 		const stringifyResult = (value: unknown) => {
 			if (typeof value === "string")
 				return { resultType: "string", result: value };
-			return { resultType: "json", result: JSON.stringify(value) };
+			return { resultType: "json", result: safeJsonStringify(value) };
 		};
 
 		// Template mode: if redirect_url contains `{{...}}`, replace placeholders instead
@@ -605,7 +616,7 @@ function App() {
 
 	const requestPreview = React.useMemo(() => {
 		if (requestError) return null;
-		return JSON.stringify({ method, params: rpcParams }, null, 2);
+		return safeJsonStringify({ method, params: rpcParams }, 2);
 	}, [method, rpcParams, requestError]);
 
 	const responseText = React.useMemo(() => {
@@ -613,12 +624,12 @@ function App() {
 		if (result == null) return "";
 		return typeof result === "string"
 			? result
-			: JSON.stringify(result, null, 2);
+			: safeJsonStringify(result, 2);
 	}, [executionError, result]);
 
 	const decodedPreview = React.useMemo(() => {
 		if (!decodedCalls) return null;
-		return JSON.stringify(
+		return safeJsonStringify(
 			decodedCalls.map((c) =>
 				c.ok
 					? {
@@ -635,7 +646,6 @@ function App() {
 							possibleSignatures: c.possibleSignatures,
 						},
 			),
-			null,
 			2,
 		);
 	}, [decodedCalls]);
