@@ -1,4 +1,13 @@
 import { whatsabi } from "@shazow/whatsabi";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import {
+	AlertTriangle,
+	Check,
+	Copy,
+	Loader2,
+	LogOut,
+	Wallet,
+} from "lucide-react";
 import { createParser, parseAsInteger, useQueryState } from "nuqs";
 import * as React from "react";
 import {
@@ -17,6 +26,12 @@ import {
 	useSwitchChain,
 	useWalletClient,
 } from "wagmi";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { Textarea } from "@/components/ui/textarea";
 import { config } from "./wagmi";
 
 type JsonObject = Record<string, unknown>;
@@ -287,24 +302,7 @@ function App() {
 		[method, rpcParams],
 	);
 
-	const [result, setResult] = React.useState<unknown>(null);
-	const [executionError, setExecutionError] = React.useState<string | null>(
-		null,
-	);
-	const [isExecuting, setIsExecuting] = React.useState(false);
 	const [copyStatus, setCopyStatus] = React.useState<string | null>(null);
-	const [decodedCalls, setDecodedCalls] = React.useState<DecodedCall[] | null>(
-		null,
-	);
-	const [isDecoding, setIsDecoding] = React.useState(false);
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reset state when inputs change
-	React.useEffect(() => {
-		setResult(null);
-		setExecutionError(null);
-		setCopyStatus(null);
-		setDecodedCalls(null);
-	}, [method, rawParams, requestedChainId, redirectUrl]);
 
 	async function copyToClipboard(text: string) {
 		try {
@@ -327,7 +325,8 @@ function App() {
 		payload: { result?: unknown; error?: string },
 	) {
 		const stringifyResult = (value: unknown) => {
-			if (typeof value === "string") return { resultType: "string", result: value };
+			if (typeof value === "string")
+				return { resultType: "string", result: value };
 			return { resultType: "json", result: JSON.stringify(value) };
 		};
 
@@ -339,8 +338,11 @@ function App() {
 		// - {{result_raw}} / {{error_raw}} are unencoded
 		// - {{resultType}} is `string` or `json`
 		if (input.includes("{{")) {
-			const replaceAll = (source: string, search: string, replacement: string) =>
-				source.split(search).join(replacement);
+			const replaceAll = (
+				source: string,
+				search: string,
+				replacement: string,
+			) => source.split(search).join(replacement);
 
 			const res =
 				payload.result !== undefined ? stringifyResult(payload.result) : null;
@@ -421,322 +423,468 @@ function App() {
 		connection.chainId != null &&
 		connection.chainId !== requestedChainId;
 
+	const chainSwitchMutation = useMutation({
+		mutationFn: async (chainId: SupportedChainId) => {
+			await switchChainAsync({ chainId });
+		},
+	});
+	const isSwitchingChain = chainSwitchMutation.isPending;
+	const chainSwitchError = chainSwitchMutation.error
+		? chainSwitchMutation.error instanceof Error
+			? chainSwitchMutation.error.message
+			: String(chainSwitchMutation.error)
+		: null;
+
+	const lastAutoSwitchKeyRef = React.useRef<string | null>(null);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: auto-switch once per (address, chainId)
+	React.useEffect(() => {
+		if (!isConnected) return;
+		if (!chainIdSupported) return;
+		if (!connectedAddress) return;
+		if (requestedChainId == null) return;
+		if (connection.chainId === requestedChainId) return;
+
+		const key = `${connectedAddress}:${requestedChainId}`;
+		if (lastAutoSwitchKeyRef.current === key) return;
+		lastAutoSwitchKeyRef.current = key;
+
+		chainSwitchMutation.mutate(requestedChainId as SupportedChainId);
+	}, [
+		chainIdSupported,
+		connectedAddress,
+		connection.chainId,
+		isConnected,
+		requestedChainId,
+	]);
+
 	const canOpenRequest =
 		connection.status === "connected" &&
 		walletClient != null &&
 		builtOk &&
-		chainIdSupported;
+		chainIdSupported &&
+		!needsChainSwitch &&
+		!isSwitchingChain;
 
-	React.useEffect(() => {
-		let cancelled = false;
+	const { data: decodedCalls = null, isLoading: isDecoding } = useQuery({
+		queryKey: ["decodedCalls", method, calldataTargets] as const,
+		queryFn: async () => {
+			if (!publicClient) throw new Error("No public client");
 
-		async function run() {
-			if (!chainIdSupported) return;
-			if (!builtOk) return;
-			if (!method) return;
-			if (!publicClient) return;
-			if (calldataTargets.length === 0) return;
+			const signatureLookup = new whatsabi.loaders.OpenChainSignatureLookup();
 
-			setIsDecoding(true);
-			try {
-				const signatureLookup = new whatsabi.loaders.OpenChainSignatureLookup();
+			return Promise.all(
+				calldataTargets.map(async ({ to, data }): Promise<DecodedCall> => {
+					const selector = data.slice(0, 10);
+					try {
+						const r = await whatsabi.autoload(to, {
+							provider: publicClient,
+							followProxies: true,
+						});
 
-				const decoded = await Promise.all(
-					calldataTargets.map(async ({ to, data }): Promise<DecodedCall> => {
-						const selector = data.slice(0, 10);
-						try {
-							const r = await whatsabi.autoload(to, {
-								provider: publicClient,
-								followProxies: true,
-							});
-
-							if (!r.abi) {
-								const possibleSignatures =
-									await signatureLookup.loadFunctions(selector);
-								return {
-									ok: false,
-									to,
-									data,
-									error: "ABI not found",
-									selector,
-									possibleSignatures: possibleSignatures.slice(0, 5),
-								};
-							}
-
-							const decodedFn = decodeFunctionData({
-								abi: r.abi as Abi,
-								data,
-							});
-
-							return {
-								ok: true,
-								to,
-								data,
-								decoded: {
-									functionName: decodedFn.functionName,
-									args: decodedFn.args as unknown,
-								},
-								resolvedAddress:
-									typeof (r as unknown as { address?: unknown }).address ===
-									"string"
-										? ((r as unknown as { address: string }).address as string)
-										: undefined,
-								contractName:
-									typeof (r as unknown as { name?: unknown }).name === "string"
-										? ((r as unknown as { name: string }).name as string)
-										: undefined,
-							};
-						} catch (e) {
-							const message = e instanceof Error ? e.message : String(e);
-							let possibleSignatures: string[] | undefined;
-							try {
-								possibleSignatures = (
-									await signatureLookup.loadFunctions(selector)
-								).slice(0, 5);
-							} catch {
-								// ignore
-							}
+						if (!r.abi) {
+							const possibleSignatures =
+								await signatureLookup.loadFunctions(selector);
 							return {
 								ok: false,
 								to,
 								data,
-								error: message,
+								error: "ABI not found",
 								selector,
-								possibleSignatures,
+								possibleSignatures: possibleSignatures.slice(0, 5),
 							};
 						}
-					}),
-				);
 
-				if (!cancelled) setDecodedCalls(decoded);
-			} finally {
-				if (!cancelled) setIsDecoding(false);
+						const decodedFn = decodeFunctionData({
+							abi: r.abi as Abi,
+							data,
+						});
+
+						return {
+							ok: true,
+							to,
+							data,
+							decoded: {
+								functionName: decodedFn.functionName,
+								args: decodedFn.args as unknown,
+							},
+							resolvedAddress:
+								typeof (r as unknown as { address?: unknown }).address ===
+								"string"
+									? ((r as unknown as { address: string }).address as string)
+									: undefined,
+							contractName:
+								typeof (r as unknown as { name?: unknown }).name === "string"
+									? ((r as unknown as { name: string }).name as string)
+									: undefined,
+						};
+					} catch (e) {
+						const message = e instanceof Error ? e.message : String(e);
+						let possibleSignatures: string[] | undefined;
+						try {
+							possibleSignatures = (
+								await signatureLookup.loadFunctions(selector)
+							).slice(0, 5);
+						} catch {
+							// ignore
+						}
+						return {
+							ok: false,
+							to,
+							data,
+							error: message,
+							selector,
+							possibleSignatures,
+						};
+					}
+				}),
+			);
+		},
+		enabled:
+			chainIdSupported &&
+			builtOk &&
+			!!method &&
+			!!publicClient &&
+			calldataTargets.length > 0,
+	});
+
+	const executionMutation = useMutation({
+		mutationFn: async () => {
+			if (!walletClient || !method || !built.ok) {
+				throw new Error("Missing wallet client or method");
 			}
-		}
 
-		run();
-		return () => {
-			cancelled = true;
-		};
-	}, [builtOk, calldataTargets, chainIdSupported, method, publicClient]);
-
-	async function openRequest() {
-		if (!walletClient) return;
-		if (!builtOk) return;
-		if (!method) return;
-		if (!chainIdSupported) return;
-
-		setIsExecuting(true);
-		setExecutionError(null);
-		setResult(null);
-		setCopyStatus(null);
-
-		try {
-			if (connection.chainId !== requestedChainId) {
-				await switchChainAsync({
-					chainId: requestedChainId as SupportedChainId,
+			try {
+				return await walletClient.request({
+					// wagmi/viem are typed for known methods; this app is intentionally generic.
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					method: method as any,
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					params: built.params as any,
 				});
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+
+				if (normalizedRedirectUrl) {
+					try {
+						const target = buildRedirectTarget(normalizedRedirectUrl, {
+							error: message,
+						});
+						window.location.assign(target);
+					} catch (redirectErr) {
+						const redirectMessage =
+							redirectErr instanceof Error
+								? redirectErr.message
+								: String(redirectErr);
+						throw new Error(`${message} (redirect failed: ${redirectMessage})`);
+					}
+				}
+
+				throw new Error(message);
 			}
-
-			const res = await walletClient.request({
-				// wagmi/viem are typed for known methods; this app is intentionally generic.
-				// eslint-disable-next-line @typescript-eslint/no-explicit-any
-				method: method as any,
-				// eslint-disable-next-line @typescript-eslint/no-explicit-any
-				params: built.params as any,
-			});
-			setResult(res);
-
+		},
+		onSuccess: (res) => {
 			if (normalizedRedirectUrl) {
 				const target = buildRedirectTarget(normalizedRedirectUrl, {
 					result: res,
 				});
 				window.location.assign(target);
 			}
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			setExecutionError(message);
+		},
+	});
 
-			if (normalizedRedirectUrl) {
-				try {
-					const target = buildRedirectTarget(normalizedRedirectUrl, {
-						error: message,
-					});
-					window.location.assign(target);
-				} catch (redirectErr) {
-					const redirectMessage =
-						redirectErr instanceof Error
-							? redirectErr.message
-							: String(redirectErr);
-					setExecutionError(`${message} (redirect failed: ${redirectMessage})`);
-				}
-			}
-		} finally {
-			setIsExecuting(false);
-		}
-	}
+	const result = executionMutation.data ?? null;
+	const executionError = executionMutation.error?.message ?? null;
+	const isExecuting = executionMutation.isPending;
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reset state when inputs change
+	React.useEffect(() => {
+		executionMutation.reset();
+		setCopyStatus(null);
+	}, [method, rawParams, requestedChainId, redirectUrl]);
+
+	const requestPreview = React.useMemo(() => {
+		if (requestError) return null;
+		return JSON.stringify({ method, params: rpcParams }, null, 2);
+	}, [method, rpcParams, requestError]);
+
+	const responseText = React.useMemo(() => {
+		if (executionError) return executionError;
+		if (result == null) return "";
+		return typeof result === "string"
+			? result
+			: JSON.stringify(result, null, 2);
+	}, [executionError, result]);
+
+	const decodedPreview = React.useMemo(() => {
+		if (!decodedCalls) return null;
+		return JSON.stringify(
+			decodedCalls.map((c) =>
+				c.ok
+					? {
+							to: c.to,
+							contractName: c.contractName,
+							resolvedAddress: c.resolvedAddress,
+							function: c.decoded.functionName,
+							args: c.decoded.args,
+						}
+					: {
+							to: c.to,
+							selector: c.selector,
+							error: c.error,
+							possibleSignatures: c.possibleSignatures,
+						},
+			),
+			null,
+			2,
+		);
+	}, [decodedCalls]);
 
 	return (
-		<>
-			<div>
-				<h2>Request</h2>
-
-				<div>
-					method: {method ?? "(missing)"}
-					<br />
-					chainId: {requestedChainId ?? "(missing)"}
-					<br />
-					redirect_url: {normalizedRedirectUrl ?? "(none)"}
-				</div>
-
-				{requestError ? (
-					<div>error: {requestError}</div>
-				) : (
-					<>
-						{needsChainSwitch && (
-							<div>
-								note: will switch chain to {requestedChainId} before executing
-							</div>
-						)}
-						<div>will request:</div>
-						<pre>{JSON.stringify({ method, params: rpcParams }, null, 2)}</pre>
-
-						{calldataTargets.length > 0 && (
+		<div className="min-h-svh bg-background text-foreground">
+			<main className="mx-auto flex w-full max-w-2xl flex-col gap-4 p-4">
+				<header className="flex items-start justify-between gap-3">
+					<div className="space-y-1">
+						<h1 className="text-lg font-semibold">Open Tx</h1>
+						<p className="text-sm text-muted-foreground">
+							review a wallet request, connect, approve
+						</p>
+					</div>
+					<Badge variant={requestError ? "destructive" : "secondary"}>
+						{requestError ? (
 							<>
-								<div>
-									calldata decoding:{" "}
-									{isDecoding ? "loading…" : decodedCalls ? "ready" : "pending"}
-								</div>
-								{decodedCalls && (
-									<pre>
-										{JSON.stringify(
-											decodedCalls.map((c) =>
-												c.ok
-													? {
-															to: c.to,
-															contractName: c.contractName,
-															resolvedAddress: c.resolvedAddress,
-															function: c.decoded.functionName,
-															args: c.decoded.args,
-														}
-													: {
-															to: c.to,
-															selector: c.selector,
-															error: c.error,
-															possibleSignatures: c.possibleSignatures,
-														},
-											),
-											null,
-											2,
+								<AlertTriangle />
+								Fix request
+							</>
+						) : (
+							<>
+								<Check />
+								Ready
+							</>
+						)}
+					</Badge>
+				</header>
+
+				<Card>
+					<CardHeader className="space-y-1">
+						<CardTitle className="text-base">Request</CardTitle>
+						<div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
+							<Badge variant="outline">method: {method ?? "(missing)"}</Badge>
+							<Badge variant="outline">
+								chainId: {requestedChainId ?? "(missing)"}
+							</Badge>
+							{normalizedRedirectUrl ? (
+								<Badge variant="secondary">redirect enabled</Badge>
+							) : (
+								<Badge variant="outline">no redirect</Badge>
+							)}
+						</div>
+					</CardHeader>
+					<CardContent className="space-y-3">
+						{requestError ? (
+							<Alert variant="destructive">
+								<AlertTriangle className="h-4 w-4" />
+								<AlertTitle>Invalid request</AlertTitle>
+								<AlertDescription>{requestError}</AlertDescription>
+							</Alert>
+						) : (
+							<>
+								{needsChainSwitch && (
+									<Alert variant={chainSwitchError ? "destructive" : undefined}>
+										{chainSwitchError ? (
+											<AlertTriangle className="h-4 w-4" />
+										) : (
+											<Loader2
+												className={isSwitchingChain ? "animate-spin" : ""}
+											/>
 										)}
+										<AlertTitle>
+											{chainSwitchError
+												? "Chain switch failed"
+												: isSwitchingChain
+													? "Switching chain"
+													: "Chain switch required"}
+										</AlertTitle>
+										<AlertDescription>
+											{chainSwitchError
+												? chainSwitchError
+												: isSwitchingChain
+													? `Approve switching to chainId ${requestedChainId} in your wallet.`
+													: `Please switch to chainId ${requestedChainId} in your wallet.`}
+										</AlertDescription>
+									</Alert>
+								)}
+
+								<div>
+									<div className="mb-2 text-sm font-medium">Preview</div>
+									<pre className="max-h-64 overflow-auto rounded-md bg-muted p-3 text-xs">
+										{requestPreview}
 									</pre>
+								</div>
+
+								{calldataTargets.length > 0 && (
+									<>
+										<Separator />
+										<div className="flex items-center justify-between gap-2">
+											<div className="text-sm font-medium">
+												Calldata decoding
+											</div>
+											<Badge variant="outline">
+												{isDecoding
+													? "loading"
+													: decodedCalls
+														? "ready"
+														: "pending"}
+											</Badge>
+										</div>
+										{decodedPreview && (
+											<pre className="max-h-64 overflow-auto rounded-md bg-muted p-3 text-xs">
+												{decodedPreview}
+											</pre>
+										)}
+									</>
 								)}
 							</>
 						)}
-					</>
-				)}
-			</div>
+					</CardContent>
+				</Card>
 
-			{isConnected ? (
-				<div>
-					<h2>Wallet</h2>
+				<Card>
+					<CardHeader className="space-y-1">
+						<CardTitle className="text-base">Wallet</CardTitle>
+						<div className="text-sm text-muted-foreground">
+							{isConnected ? "Connected" : "Connect to continue"}
+						</div>
+					</CardHeader>
+					<CardContent className="space-y-3">
+						{isConnected ? (
+							<>
+								<div className="flex flex-wrap items-center gap-2 text-sm">
+									<Badge variant="secondary">
+										<Wallet />
+										{connectedAddress ?? "(unknown)"}
+									</Badge>
+									<Badge variant="outline">
+										chainId: {connection.chainId ?? "(unknown)"}
+									</Badge>
+								</div>
 
-					<div>connected: {connectedAddress ?? "(unknown)"}</div>
-					<div>current chainId: {connection.chainId ?? "(unknown)"}</div>
+								<div className="flex flex-wrap gap-2">
+									{needsChainSwitch && requestedChainId != null && (
+										<Button
+											variant="outline"
+											onClick={() =>
+												chainSwitchMutation.mutate(
+													requestedChainId as SupportedChainId,
+												)
+											}
+											disabled={isSwitchingChain}
+										>
+											{isSwitchingChain ? (
+												<>
+													<Loader2 className="animate-spin" />
+													Switching
+												</>
+											) : (
+												<>Switch to {requestedChainId}</>
+											)}
+										</Button>
+									)}
+									<Button
+										onClick={() => executionMutation.mutate()}
+										disabled={!canOpenRequest || isExecuting}
+									>
+										{isExecuting ? (
+											<>
+												<Loader2 className="animate-spin" />
+												Opening
+											</>
+										) : (
+											<>Open Request</>
+										)}
+									</Button>
+									<Button variant="outline" onClick={() => disconnect()}>
+										<LogOut />
+										Disconnect
+									</Button>
+								</div>
 
-					<button type="button" onClick={() => disconnect()}>
-						Disconnect
-					</button>
-
-					<div>
-						<button
-							type="button"
-							onClick={() => openRequest()}
-							disabled={!canOpenRequest || isExecuting}
-						>
-							{isExecuting ? "Opening…" : "Open Request"}
-						</button>
-						{!canOpenRequest && !isExecuting && (
-							<div>
-								{requestError
-									? `fix request: ${requestError}`
-									: "waiting for wallet client…"}
-							</div>
+								{!canOpenRequest && !isExecuting && (
+									<p className="text-sm text-muted-foreground">
+										{requestError
+											? `Fix request: ${requestError}`
+											: "Waiting for wallet client…"}
+									</p>
+								)}
+								{normalizedRedirectUrl && (
+									<p className="text-sm text-muted-foreground">
+										After approval, you will be redirected.
+									</p>
+								)}
+							</>
+						) : (
+							<>
+								<div className="flex flex-col gap-2">
+									{connectors.map((connector) => (
+										<Button
+											key={connector.uid}
+											variant="outline"
+											onClick={() => connect({ connector })}
+										>
+											<Wallet />
+											{connector.name}
+										</Button>
+									))}
+								</div>
+								{status && (
+									<p className="text-sm text-muted-foreground">{status}</p>
+								)}
+								{error?.message && (
+									<Alert variant="destructive">
+										<AlertTriangle className="h-4 w-4" />
+										<AlertTitle>Connection error</AlertTitle>
+										<AlertDescription>{error.message}</AlertDescription>
+									</Alert>
+								)}
+							</>
 						)}
-						{normalizedRedirectUrl && (
-							<div>after approval, you will be redirected to redirect_url</div>
-						)}
-					</div>
-				</div>
-			) : (
-				<div>
-					<h2>Connect Wallet</h2>
-					<div>connect to review + open the request</div>
-					{connectors.map((connector) => (
-						<button
-							key={connector.uid}
-							onClick={() => connect({ connector })}
-							type="button"
-						>
-							{connector.name}
-						</button>
-					))}
-					{status && <div>{status}</div>}
-					{error?.message && <div>{error.message}</div>}
-				</div>
-			)}
+					</CardContent>
+				</Card>
 
-			{!normalizedRedirectUrl && (result != null || executionError != null) && (
-				<div>
-					<h2>Response</h2>
-					{executionError && <div>error: {executionError}</div>}
+				{!normalizedRedirectUrl &&
+					(result != null || executionError != null) && (
+						<Card>
+							<CardHeader className="space-y-1">
+								<CardTitle className="text-base">Response</CardTitle>
+								<div className="text-sm text-muted-foreground">
+									copy the value and send it back
+								</div>
+							</CardHeader>
+							<CardContent className="space-y-3">
+								<div className="flex flex-wrap items-center gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										onClick={async () => {
+											await copyToClipboard(responseText);
+											setCopyStatus("Copied");
+										}}
+										disabled={!responseText}
+									>
+										<Copy />
+										Copy
+									</Button>
+									{copyStatus && (
+										<Badge variant="secondary">{copyStatus}</Badge>
+									)}
+								</div>
 
-					<div>
-						{executionError && (
-							<button
-								type="button"
-								onClick={async () => {
-									await copyToClipboard(executionError);
-									setCopyStatus("Copied error");
-								}}
-							>
-								Copy error
-							</button>
-						)}
-						{result != null && (
-							<button
-								type="button"
-								onClick={async () => {
-									const text =
-										typeof result === "string"
-											? result
-											: JSON.stringify(result);
-									await copyToClipboard(text);
-									setCopyStatus("Copied result");
-								}}
-							>
-								Copy result
-							</button>
-						)}
-						{copyStatus && <span> {copyStatus}</span>}
-					</div>
-
-					<textarea
-						readOnly
-						rows={10}
-						value={
-							executionError
-								? executionError
-								: result == null
-									? ""
-									: typeof result === "string"
-										? result
-										: JSON.stringify(result, null, 2)
-						}
-					/>
-				</div>
-			)}
-		</>
+								<Textarea readOnly rows={10} value={responseText} />
+							</CardContent>
+						</Card>
+					)}
+			</main>
+		</div>
 	);
 }
 
