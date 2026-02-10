@@ -20,6 +20,11 @@ Query params:
 - `params`: URL-encoded JSON (either an object or an array).
 - `redirect_url` (optional): where to redirect after success/failure with the result.
 
+redirect_url modes:
+
+- Default: the app appends `resultType`/`result` (or `error`) query params to `redirect_url`.
+- Template mode: if `redirect_url` contains `{{...}}`, the app replaces placeholders instead of appending query params.
+
 Notes:
 
 - If `params` is a JSON array, it is treated as the exact JSON-RPC `params` array.
@@ -82,13 +87,29 @@ In your message to the user, ask them to paste back:
 
 If you include `redirect_url`, the app redirects after success or failure.
 
-It appends query params:
+It appends query params (default mode):
 
 - On success:
   - `resultType=string` and `result=<value>` OR
   - `resultType=json` and `result=<JSON.stringify(value)>`
 - On failure:
   - `error=<message>`
+
+Template mode (no bridge, good for messaging apps):
+
+- If `redirect_url` contains `{{...}}`, placeholders are replaced and no query params are appended.
+- Placeholders:
+  - `{{result}}`: URL-encoded result string (or URL-encoded `JSON.stringify(result)`)
+  - `{{result_raw}}`: unencoded result string (or `JSON.stringify(result)`)
+  - `{{resultType}}`: `string` or `json`
+  - `{{error}}`: URL-encoded error message
+  - `{{error_raw}}`: unencoded error message
+
+Example (Telegram share):
+
+```text
+https://tx.steer.fun/?method=eth_sendTransaction&chainId=1&params=...&redirect_url=https%3A%2F%2Ft.me%2Fshare%2Furl%3Ftext%3DTx%2520hash%253A%2520%7B%7Bresult%7D%7D
+```
 
 Implementation note for agents:
 

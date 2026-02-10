@@ -282,6 +282,48 @@ function App() {
 		input: string,
 		payload: { result?: unknown; error?: string },
 	) {
+		const stringifyResult = (value: unknown) => {
+			if (typeof value === "string") return { resultType: "string", result: value };
+			return { resultType: "json", result: JSON.stringify(value) };
+		};
+
+		// Template mode: if redirect_url contains `{{...}}`, replace placeholders instead
+		// of appending `?result=...` style query params.
+		//
+		// Placeholders:
+		// - {{result}} / {{error}} are URL-encoded
+		// - {{result_raw}} / {{error_raw}} are unencoded
+		// - {{resultType}} is `string` or `json`
+		if (input.includes("{{")) {
+			const replaceAll = (source: string, search: string, replacement: string) =>
+				source.split(search).join(replacement);
+
+			const res =
+				payload.result !== undefined ? stringifyResult(payload.result) : null;
+			const error = payload.error ?? "";
+			let out = input;
+			out = replaceAll(out, "{{resultType}}", res?.resultType ?? "");
+			out = replaceAll(out, "{{result_raw}}", res?.result ?? "");
+			out = replaceAll(out, "{{error_raw}}", error);
+			out = replaceAll(
+				out,
+				"{{result}}",
+				res ? encodeURIComponent(res.result) : "",
+			);
+			out = replaceAll(
+				out,
+				"{{error}}",
+				error ? encodeURIComponent(error) : "",
+			);
+
+			const url = new URL(out, window.location.origin);
+			if (url.protocol !== "http:" && url.protocol !== "https:") {
+				throw new Error(`Unsupported redirect_url protocol: ${url.protocol}`);
+			}
+			return url.toString();
+		}
+
+		// Default mode: append result/error as query params.
 		const base = new URL(input, window.location.origin);
 		if (base.protocol !== "http:" && base.protocol !== "https:") {
 			throw new Error(`Unsupported redirect_url protocol: ${base.protocol}`);
@@ -292,13 +334,9 @@ function App() {
 		}
 
 		if (payload.result !== undefined) {
-			if (typeof payload.result === "string") {
-				base.searchParams.set("resultType", "string");
-				base.searchParams.set("result", payload.result);
-			} else {
-				base.searchParams.set("resultType", "json");
-				base.searchParams.set("result", JSON.stringify(payload.result));
-			}
+			const res = stringifyResult(payload.result);
+			base.searchParams.set("resultType", res.resultType);
+			base.searchParams.set("result", res.result);
 		}
 
 		return base.toString();
