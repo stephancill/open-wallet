@@ -1,16 +1,27 @@
-import { createConfig, http } from 'wagmi'
-import { mainnet, sepolia } from 'wagmi/chains'
+import type { Chain } from "viem";
+import { createConfig, http, type Transport } from "wagmi";
+import * as chains from "wagmi/chains";
+
+const chainList = Object.values(chains) as unknown as readonly [
+	Chain,
+	...Chain[],
+];
+
+const transports = chainList.reduce(
+	(acc, chain) => {
+		acc[chain.id] = http();
+		return acc;
+	},
+	{} as Record<number, Transport>,
+);
 
 export const config = createConfig({
-  chains: [mainnet, sepolia],
-  transports: {
-    [mainnet.id]: http(),
-    [sepolia.id]: http(),
-  },
-})
+	chains: chainList,
+	transports,
+});
 
-declare module 'wagmi' {
-  interface Register {
-    config: typeof config
-  }
+declare module "wagmi" {
+	interface Register {
+		config: typeof config;
+	}
 }
