@@ -29,6 +29,7 @@ Notes:
 
 - If `params` is a JSON array, it is treated as the exact JSON-RPC `params` array.
 - If `params` is a JSON object, the app will map it to common method shapes (e.g. fill `from` from the connected wallet when possible).
+- Avoid double-encoding: `params` should be encoded exactly once (e.g. `encodeURIComponent(JSON.stringify(params))`). If you see `%2522` in the URL, it was encoded twice.
 
 ## Common Flows
 
@@ -105,15 +106,17 @@ Template mode (no bridge, good for messaging apps):
   - `{{error}}`: URL-encoded error message
   - `{{error_raw}}`: unencoded error message
 
-Example (Telegram share):
-
-```text
-https://tx.steer.fun/?method=eth_sendTransaction&chainId=1&params=...&redirect_url=https%3A%2F%2Ft.me%2Fshare%2Furl%3Ftext%3DTx%2520hash%253A%2520%7B%7Bresult%7D%7D
-```
-
 Implementation note for agents:
 
 - Consider generating a “compose draft” deep link into your chat with the user and using that as `redirect_url` so, after approval, the user lands in a pre-filled message back to you containing the result.
+
+Example (Telegram share):
+
+Note: Telegram's share endpoint works best when you include both `url=` and `text=`. If you omit `url=`, it may redirect to telegram.org instead of showing the share UI.
+
+```text
+https://tx.steer.fun/?method=personal_sign&chainId=1&params=%7B%22message%22%3A%22hello%22%7D&redirect_url=https%3A%2F%2Ft.me%2Fshare%2Furl%3Furl%3Dhttps%253A%252F%252Ftx.steer.fun%252F%26text%3DSignature%253A%2520%7B%7Bresult%7D%7D
+```
 
 ## Safety Checks
 

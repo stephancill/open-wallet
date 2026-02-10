@@ -33,7 +33,7 @@ Placeholders:
 Example (Telegram share):
 
 ```text
-https://tx.steer.fun/?method=eth_sendTransaction&chainId=1&params=...&redirect_url=https%3A%2F%2Ft.me%2Fshare%2Furl%3Ftext%3DTx%2520hash%253A%2520%7B%7Bresult%7D%7D
+https://tx.steer.fun/?method=eth_sendTransaction&chainId=1&params=...&redirect_url=https%3A%2F%2Ft.me%2Fshare%2Furl%3Furl%3Dhttps%253A%252F%252Ftx.steer.fun%252F%26text%3DTx%2520hash%253A%2520%7B%7Bresult%7D%7D
 ```
 
 Redirect query params appended (when redirect_url has no `{{...}}` placeholders):

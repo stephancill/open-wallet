@@ -23,14 +23,53 @@ type JsonObject = Record<string, unknown>;
 
 const parseAsUnsafeJson = createParser({
 	parse: (query: string) => {
-		try {
-			return JSON.parse(query) as unknown;
-		} catch {
-			return null;
+		const maybeDecodeOnce = (value: string) => {
+			if (!value.includes("%")) return value;
+			try {
+				return decodeURIComponent(value);
+			} catch {
+				return value;
+			}
+		};
+
+		const candidates = [
+			query,
+			maybeDecodeOnce(query),
+			maybeDecodeOnce(maybeDecodeOnce(query)),
+		];
+
+		for (const candidate of candidates) {
+			try {
+				return JSON.parse(candidate) as unknown;
+			} catch {
+				// keep trying
+			}
 		}
+
+		return null;
 	},
 	serialize: (value: unknown) => JSON.stringify(value),
 });
+
+function normalizeRedirectUrl(input: string) {
+	const maybeDecodeOnce = (value: string) => {
+		if (!value.includes("%")) return value;
+		try {
+			return decodeURIComponent(value);
+		} catch {
+			return value;
+		}
+	};
+
+	let out = input;
+	for (let i = 0; i < 2; i += 1) {
+		const decoded = maybeDecodeOnce(out);
+		if (decoded === out) break;
+		out = decoded;
+	}
+
+	return out;
+}
 
 function isJsonObject(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -229,6 +268,11 @@ function App() {
 	const [requestedChainId] = useQueryState("chainId", parseAsInteger);
 	const [rawParams] = useQueryState("params", parseAsUnsafeJson);
 	const [redirectUrl] = useQueryState("redirect_url");
+	const normalizedRedirectUrl = React.useMemo(() => {
+		if (!redirectUrl) return null;
+		const normalized = normalizeRedirectUrl(redirectUrl).trim();
+		return normalized.length > 0 ? normalized : null;
+	}, [redirectUrl]);
 
 	const connectedAddress = connection.addresses?.[0];
 	const built = React.useMemo(
@@ -503,17 +547,21 @@ function App() {
 			});
 			setResult(res);
 
-			if (redirectUrl) {
-				const target = buildRedirectTarget(redirectUrl, { result: res });
+			if (normalizedRedirectUrl) {
+				const target = buildRedirectTarget(normalizedRedirectUrl, {
+					result: res,
+				});
 				window.location.assign(target);
 			}
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			setExecutionError(message);
 
-			if (redirectUrl) {
+			if (normalizedRedirectUrl) {
 				try {
-					const target = buildRedirectTarget(redirectUrl, { error: message });
+					const target = buildRedirectTarget(normalizedRedirectUrl, {
+						error: message,
+					});
 					window.location.assign(target);
 				} catch (redirectErr) {
 					const redirectMessage =
@@ -538,7 +586,7 @@ function App() {
 					<br />
 					chainId: {requestedChainId ?? "(missing)"}
 					<br />
-					redirect_url: {redirectUrl ?? "(none)"}
+					redirect_url: {normalizedRedirectUrl ?? "(none)"}
 				</div>
 
 				{requestError ? (
@@ -615,7 +663,7 @@ function App() {
 									: "waiting for wallet client…"}
 							</div>
 						)}
-						{redirectUrl && (
+						{normalizedRedirectUrl && (
 							<div>after approval, you will be redirected to redirect_url</div>
 						)}
 					</div>
@@ -638,7 +686,7 @@ function App() {
 				</div>
 			)}
 
-			{!redirectUrl && (result != null || executionError != null) && (
+			{!normalizedRedirectUrl && (result != null || executionError != null) && (
 				<div>
 					<h2>Response</h2>
 					{executionError && <div>error: {executionError}</div>}
